@@ -1,0 +1,538 @@
+name: Upload Files to CDN1
+description: Uploads all pipeline output files to CDN storage.
+inputs:
+  - name: loaded_data
+    type: Data
+    description: 'Loaded data from data loading component'
+  - name: loaded_metadata
+    type: Data
+    description: 'Metadata from data loading component'
+  - name: loaded_ground_truth
+    type: Data
+    description: 'Ground truth labels from data loading component'
+  - name: validation_data
+    type: Data
+    description: 'Validated data from data quality validation component'
+  - name: validation_report
+    type: Data
+    description: 'Validation report from data quality validation component'
+  - name: missing_handled_data
+    type: Data
+    description: 'Data after missing value handling'
+  - name: missing_handled_metadata
+    type: Data
+    description: 'Metadata from missing value handling component'
+  - name: train_indices
+    type: Data
+    description: 'Train row indices from data splitting component'
+  - name: test_indices
+    type: Data
+    description: 'Test row indices from data splitting component'
+  - name: val_indices
+    type: Data
+    description: 'Validation row indices from data splitting component'
+  - name: split_metadata
+    type: Data
+    description: 'Split metadata from data splitting component'
+  - name: outlier_handled_data
+    type: Data
+    description: 'Data after outlier handling'
+  - name: outlier_handled_metadata
+    type: Data
+    description: 'Metadata from outlier handling component'
+  - name: encoded_data
+    type: Data
+    description: 'Data after categorical encoding'
+  - name: encoded_metadata
+    type: Data
+    description: 'Metadata from categorical encoding component'
+  - name: engineered_data
+    type: Data
+    description: 'Data after feature engineering'
+  - name: engineered_metadata
+    type: Data
+    description: 'Metadata from feature engineering component'
+  - name: scaled_data
+    type: Data
+    description: 'Data after scaling'
+  - name: scaled_metadata
+    type: Data
+    description: 'Metadata from scaling component'
+  - name: fitted_scaler
+    type: Data
+    description: 'Fitted scaler object from scaling component'
+  - name: reduced_data
+    type: Data
+    description: 'Data after dimensionality reduction'
+  - name: reduced_metadata
+    type: Data
+    description: 'Metadata from dimensionality reduction component'
+  - name: train_data
+    type: Data
+    description: 'Training features X_train from final split component'
+  - name: val_data
+    type: Data
+    description: 'Validation features X_val from final split component'
+  - name: test_data
+    type: Data
+    description: 'Test features X_test from final split component'
+  - name: target_train
+    type: Data
+    description: 'Training labels y_train from final split component'
+  - name: target_val
+    type: Data
+    description: 'Validation labels y_val from final split component'
+  - name: target_test
+    type: Data
+    description: 'Test labels y_test from final split component'
+  - name: distance_statistics
+    type: Data
+    description: 'Distance statistics from distance matrix validation component'
+  - name: validation_report_distance
+    type: Data
+    description: 'Distance validation report from distance matrix validation component'
+  - name: parameter_report
+    type: Data
+    description: 'Parameter validation report from parameter validation component'
+  - name: validated_params
+    type: Data
+    description: 'Validated parameters from parameter validation component'
+  - name: bearer_token
+    type: String
+    description: 'Bearer access token for CDN authentication'
+  - name: domain
+    type: String
+    description: 'CDN domain URL'
+  - name: get_cdn
+    type: String
+    description: 'CDN base URL for retrieving uploaded files'
+  - name: upload_prefix
+    type: String
+    description: 'Optional prefix path for CDN uploads'
+    default: ''
+
+outputs:
+  - name: cdn_manifest
+    type: Data
+    description: 'JSON manifest with all CDN URLs organized by component'
+  - name: upload_summary
+    type: String
+    description: 'Upload statistics summary'
+
+implementation:
+  container:
+    image: nikhilv215/nesy-factory:v23
+    command:
+      - sh
+      - -ec
+      - |
+        if ! command -v curl >/dev/null 2>&1; then
+          apt-get update >/dev/null && apt-get install -y curl >/dev/null
+        fi
+        exec "$0" "$@"
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse
+        import os
+        import subprocess
+        import json
+        import time
+        
+        parser = argparse.ArgumentParser()
+        
+        parser.add_argument('--loaded-data', type=str, default='')
+        parser.add_argument('--loaded-metadata', type=str, default='')
+        parser.add_argument('--loaded-ground-truth', type=str, default='')
+        parser.add_argument('--validation-data', type=str, default='')
+        parser.add_argument('--validation-report', type=str, default='')
+        parser.add_argument('--missing-handled-data', type=str, default='')
+        parser.add_argument('--missing-handled-metadata', type=str, default='')
+        parser.add_argument('--train-indices', type=str, default='')
+        parser.add_argument('--test-indices', type=str, default='')
+        parser.add_argument('--val-indices', type=str, default='')
+        parser.add_argument('--split-metadata', type=str, default='')
+        parser.add_argument('--outlier-handled-data', type=str, default='')
+        parser.add_argument('--outlier-handled-metadata', type=str, default='')
+        parser.add_argument('--encoded-data', type=str, default='')
+        parser.add_argument('--encoded-metadata', type=str, default='')
+        parser.add_argument('--engineered-data', type=str, default='')
+        parser.add_argument('--engineered-metadata', type=str, default='')
+        parser.add_argument('--scaled-data', type=str, default='')
+        parser.add_argument('--scaled-metadata', type=str, default='')
+        parser.add_argument('--fitted-scaler', type=str, default='')
+        parser.add_argument('--reduced-data', type=str, default='')
+        parser.add_argument('--reduced-metadata', type=str, default='')
+        parser.add_argument('--train-data', type=str, default='')
+        parser.add_argument('--val-data', type=str, default='')
+        parser.add_argument('--test-data', type=str, default='')
+        parser.add_argument('--target-train', type=str, default='')
+        parser.add_argument('--target-val', type=str, default='')
+        parser.add_argument('--target-test', type=str, default='')
+        parser.add_argument('--distance-statistics', type=str, default='')
+        parser.add_argument('--validation-report-distance', type=str, default='')
+        parser.add_argument('--parameter-report', type=str, default='')
+        parser.add_argument('--validated-params', type=str, default='')
+        parser.add_argument('--bearer-token', type=str, required=True)
+        parser.add_argument('--domain', type=str, required=True)
+        parser.add_argument('--get-cdn', type=str, required=True)
+        parser.add_argument('--upload-prefix', type=str, default='')
+        parser.add_argument('--cdn-manifest', type=str, required=True)
+        parser.add_argument('--upload-summary', type=str, required=True)
+        
+        args = parser.parse_args()
+        
+        print("="*80)
+        print("CDN UPLOAD - CLUSTERING PIPELINE (PARQUET AWARE)")
+        print("="*80)
+        print(f"Domain: {args.domain}")
+        print(f"CDN Base: {args.get_cdn}")
+        print("")
+        
+        bearer_token = args.bearer_token
+        print("Bearer token loaded")
+        print("")
+        
+        base_path = "/mobius-content-service/v1.0/content/upload?filePathAccess=private&filePath=%2Fbottle%2Flimka%2Fsoda%2F"
+        if args.upload_prefix:
+            upload_url = f"{args.domain}{base_path}{args.upload_prefix.replace('/', '%2F')}"
+        else:
+            upload_url = f"{args.domain}{base_path}"
+        
+        def encode_special_chars(text):
+            #Encode special characters for URL#
+            return (
+                text.replace("$", "%24")
+                    .replace("(", "%28")
+                    .replace(")", "%29")
+                    .replace("[", "%5B")
+                    .replace("]", "%5D")
+                    .replace("{", "%7B")
+                    .replace("}", "%7D")
+                    .replace(" ", "%20")
+            )
+        
+        def upload_file(file_path, file_description):
+            #Upload file to CDN with extension detection (including Parquet)#
+            if not file_path or not os.path.exists(file_path):
+                return None
+            
+            print(f"Uploading {file_description}")
+            print(f"  Local path: {file_path}")
+            
+            file_size = os.path.getsize(file_path)
+            size_kb = round(file_size/1024, 2)
+            print(f"  File size: {file_size} bytes ({size_kb} KB)")
+            
+            if file_size == 0:
+                print("  Skipped (empty file)")
+                return None
+            
+            import shutil
+            import tempfile
+            
+            filename = os.path.basename(file_path)
+            print(f"  Original filename: {filename}")
+            
+            file_ext = os.path.splitext(filename)[1]
+            print(f"  Current extension: {file_ext if file_ext else '(none)'}")
+            
+            upload_path = file_path
+            temp_file = None
+            
+            if not file_ext or file_ext == '':
+                print("  WARNING: File missing proper extension!")
+                
+                content_start = open(file_path, 'rb').read(100)
+                
+                # ADDED: Parquet detection (PAR1 magic bytes)
+                if content_start.startswith(b'PAR1') or b'PAR1' in content_start[:50]:
+                    detected_ext = '.parquet'
+                    print("  Detected: Apache Parquet file")
+                elif content_start.startswith(b'PK'):
+                    detected_ext = '.pkl'
+                elif content_start[1:6] == b'NUMPY':
+                    detected_ext = '.npy'
+                elif b',' in content_start or content_start.startswith(b'[') or content_start.startswith(b'{'):
+                    try:
+                        test_content = open(file_path, 'r').read(200)
+                        if test_content.strip().startswith('{') or test_content.strip().startswith('['):
+                            detected_ext = '.json'
+                        else:
+                            detected_ext = '.csv'
+                    except:
+                        detected_ext = '.csv'
+                else:
+                    detected_ext = '.json'
+                
+                print(f"  Expected: {detected_ext}")
+                print(f"  Creating copy with proper extension: {filename}{detected_ext}")
+                
+                temp_file = tempfile.mktemp(suffix=detected_ext)
+                shutil.copy2(file_path, temp_file)
+                upload_path = temp_file
+            
+            try:
+                print("  Uploading to CDN...")
+                print(f"  DEBUG - Upload path: {upload_path}")
+                print(f"  DEBUG - File exists: {os.path.exists(upload_path)}")
+                print(f"  DEBUG - Upload URL: {upload_url}")
+                
+                result = subprocess.run(
+                    [
+                        "curl",
+                        "-v",
+                        "--location", upload_url,
+                        "--header", f"Authorization: Bearer {bearer_token}",
+                        "--form", f"file=@{upload_path}",
+                        "--fail",
+                        "--show-error"
+                    ],
+                    capture_output=True,
+                    check=True,
+                )
+                
+                response = json.loads(result.stdout.decode())
+                
+                relative_url = response.get("cdnUrl")
+                if not relative_url:
+                    raise RuntimeError(f"cdnUrl missing in response: {response}")
+                
+                print(f"  CDN relative URL: {relative_url}")
+                
+                relative_url = encode_special_chars(relative_url)
+                full_url = f"{args.get_cdn}{relative_url}"
+                
+                print("  Upload successful")
+                print(f"  Full CDN URL: {full_url}")
+                print("")
+                
+                return {
+                    "cdn_url": full_url,
+                    "filename": os.path.basename(upload_path),
+                    "size_kb": round(file_size/1024, 2),
+                    "size_mb": round(file_size/(1024*1024), 2)
+                }
+            
+            except subprocess.CalledProcessError as e:
+                print("  Upload failed!")
+                print(f"  Error: {e.stderr.decode()}")
+                print(f"  Response body: {e.stdout.decode() if e.stdout else 'none'}")
+                return None
+            
+            except Exception as e:
+                print("  Upload failed!")
+                print(f"  Error: {str(e)}")
+                return None
+            
+            finally:
+                if temp_file and os.path.exists(temp_file):
+                    os.remove(temp_file)
+        
+        # File mapping (PRESERVED - all 27 files)
+        files_to_upload = {
+            "component_02": {
+                "loaded_data": ("Original Data", args.loaded_data),
+                "loaded_metadata": ("Original Metadata", args.loaded_metadata),
+                "loaded_ground_truth": ("Ground Truth", args.loaded_ground_truth)
+            },
+            "component_03": {
+                "validation_data": ("Validated Data", args.validation_data),
+                "validation_report": ("Validation Report", args.validation_report)
+            },
+            "component_04": {
+                "missing_handled_data": ("Missing Handled Data", args.missing_handled_data),
+                "missing_handled_metadata": ("Missing Metadata", args.missing_handled_metadata)
+            },
+            "component_05": {
+                "train_indices": ("Train Indices", args.train_indices),
+                "test_indices": ("Test Indices", args.test_indices),
+                "split_metadata": ("Split Metadata", args.split_metadata)
+            },
+            "component_06": {
+                "outlier_handled_data": ("Outlier Data", args.outlier_handled_data),
+                "outlier_handled_metadata": ("Outlier Metadata", args.outlier_handled_metadata)
+            },
+            "component_07": {
+                "encoded_data": ("Encoded Data", args.encoded_data),
+                "encoded_metadata": ("Encoding Metadata", args.encoded_metadata)
+            },
+            "component_08": {
+                "engineered_data": ("Engineered Data", args.engineered_data),
+                "engineered_metadata": ("Engineering Metadata", args.engineered_metadata)
+            },
+            "component_09": {
+                "scaled_data": ("Scaled Data", args.scaled_data),
+                "scaled_metadata": ("Scaling Metadata", args.scaled_metadata),
+                "fitted_scaler": ("Fitted Scaler", args.fitted_scaler)
+            },
+            "component_10": {
+                "reduced_data": ("Reduced Data", args.reduced_data),
+                "reduced_metadata": ("Reduction Metadata", args.reduced_metadata)
+            },
+            "component_11": {
+                "train_data": ("X_train Features", args.train_data),
+                "val_data":   ("X_val Features",   args.val_data),
+                "test_data":  ("X_test Features",  args.test_data),
+                "target_train": ("y_train Labels", args.target_train),
+                "target_val":   ("y_val Labels",   args.target_val),
+                "target_test":  ("y_test Labels",  args.target_test),
+                "val_indices":  ("Validation Indices", args.val_indices)
+            },
+            "component_12": {
+                "distance_statistics": ("Distance Stats", args.distance_statistics),
+                "validation_report_distance": ("Distance Report", args.validation_report_distance)
+            },
+            "component_13": {
+                "parameter_report": ("Parameter Report", args.parameter_report),
+                "validated_params": ("Validated Params", args.validated_params)
+            }
+        }
+        
+        manifest = {
+            "upload_metadata": {
+                "timestamp": int(time.time()),
+                "upload_prefix": args.upload_prefix,
+                "cdn_base": args.get_cdn
+            },
+            "components": {},
+            "statistics": {
+                "total_files_attempted": 0,
+                "total_files_uploaded": 0,
+                "total_files_skipped": 0,
+                "total_size_bytes": 0
+            }
+        }
+        
+        for component_name, file_dict in files_to_upload.items():
+            print("")
+            print(component_name.upper())
+            component_results = {}
+            
+            for file_key, file_info in file_dict.items():
+                file_desc, file_path = file_info
+                manifest["statistics"]["total_files_attempted"] += 1
+                
+                upload_result = upload_file(file_path, file_desc)
+                
+                if upload_result:
+                    component_results[file_key] = upload_result
+                    manifest["statistics"]["total_files_uploaded"] += 1
+                    manifest["statistics"]["total_size_bytes"] += upload_result["size_kb"] * 1024
+                else:
+                    manifest["statistics"]["total_files_skipped"] += 1
+            
+            if component_results:
+                manifest["components"][component_name] = {
+                    "files": component_results,
+                    "files_uploaded": len(component_results)
+                }
+        
+        os.makedirs(os.path.dirname(args.cdn_manifest), exist_ok=True)
+        write_mode = chr(119)
+        manifest_file = open(args.cdn_manifest, write_mode)
+        json.dump(manifest, manifest_file, indent=2)
+        manifest_file.close()
+        
+        print("")
+        print("="*80)
+        print("CDN UPLOAD COMPLETE")
+        print("="*80)
+        print(f"Files attempted: {manifest['statistics']['total_files_attempted']}")
+        print(f"Files uploaded: {manifest['statistics']['total_files_uploaded']}")
+        print(f"Files skipped: {manifest['statistics']['total_files_skipped']}")
+        total_mb = round(manifest["statistics"]["total_size_bytes"] / (1024 * 1024), 2)
+        print(f"Total size: {total_mb} MB")
+        print("="*80)
+        
+        attempted_count = manifest["statistics"]["total_files_attempted"]
+        uploaded_count = manifest["statistics"]["total_files_uploaded"]
+        skipped_count = manifest["statistics"]["total_files_skipped"]
+        total_size_mb = round(manifest["statistics"]["total_size_bytes"] / (1024 * 1024), 2)
+        
+        newline = chr(10)
+        write_mode = chr(119)
+        summary_parts = [str(attempted_count), str(uploaded_count), str(skipped_count), str(total_size_mb)]
+        summary_text = newline.join(summary_parts)
+        
+        os.makedirs(os.path.dirname(args.upload_summary), exist_ok=True)
+        open(args.upload_summary, write_mode).write(summary_text)
+
+    args:
+      - --loaded-data
+      - {inputPath: loaded_data}
+      - --loaded-metadata
+      - {inputPath: loaded_metadata}
+      - --loaded-ground-truth
+      - {inputPath: loaded_ground_truth}
+      - --validation-data
+      - {inputPath: validation_data}
+      - --validation-report
+      - {inputPath: validation_report}
+      - --missing-handled-data
+      - {inputPath: missing_handled_data}
+      - --missing-handled-metadata
+      - {inputPath: missing_handled_metadata}
+      - --train-indices
+      - {inputPath: train_indices}
+      - --test-indices
+      - {inputPath: test_indices}
+      - --val-indices
+      - {inputPath: val_indices}
+      - --split-metadata
+      - {inputPath: split_metadata}
+      - --outlier-handled-data
+      - {inputPath: outlier_handled_data}
+      - --outlier-handled-metadata
+      - {inputPath: outlier_handled_metadata}
+      - --encoded-data
+      - {inputPath: encoded_data}
+      - --encoded-metadata
+      - {inputPath: encoded_metadata}
+      - --engineered-data
+      - {inputPath: engineered_data}
+      - --engineered-metadata
+      - {inputPath: engineered_metadata}
+      - --scaled-data
+      - {inputPath: scaled_data}
+      - --scaled-metadata
+      - {inputPath: scaled_metadata}
+      - --fitted-scaler
+      - {inputPath: fitted_scaler}
+      - --reduced-data
+      - {inputPath: reduced_data}
+      - --reduced-metadata
+      - {inputPath: reduced_metadata}
+      - --train-data
+      - {inputPath: train_data}
+      - --val-data
+      - {inputPath: val_data}
+      - --test-data
+      - {inputPath: test_data}
+      - --target-train
+      - {inputPath: target_train}
+      - --target-val
+      - {inputPath: target_val}
+      - --target-test
+      - {inputPath: target_test}
+      - --distance-statistics
+      - {inputPath: distance_statistics}
+      - --validation-report-distance
+      - {inputPath: validation_report_distance}
+      - --parameter-report
+      - {inputPath: parameter_report}
+      - --validated-params
+      - {inputPath: validated_params}
+      - --bearer-token
+      - {inputValue: bearer_token}
+      - --domain
+      - {inputValue: domain}
+      - --get-cdn
+      - {inputValue: get_cdn}
+      - --upload-prefix
+      - {inputValue: upload_prefix}
+      - --cdn-manifest
+      - {outputPath: cdn_manifest}
+      - --upload-summary
+      - {outputPath: upload_summary}

@@ -1,0 +1,666 @@
+name: Unified Outlier Detection & Handling v2
+description: Train-aware outlier detection for unified preprocessing. v2 FIXES - (1) handling 'remove' no longer deletes rows from the combined data (that misaligned split indices and labels); it removes outlier rows from the TRAIN set only and outputs filtered train indices + train labels. Val/test rows are never removed. (2) clip bounds and winsorize limits are computed on TRAIN rows only. Loads Parquet/CSV, SAVES AS PARQUET.
+
+inputs:
+  - name: combined_data
+    type: Data
+    description: 'Combined dataset (train + test together) (Parquet or CSV)'
+  - name: train_indices
+    type: Data
+    description: 'Train row indices (JSON array)'
+  - name: target_train
+    type: Data
+    description: 'Train labels NPY from Data Splitting (aligned with train_indices; empty array when unsupervised)'
+  - name: detection_method
+    type: String
+    description: 'Outlier detection method: zscore, iqr, lof, isolation_forest, none'
+    default: 'zscore'
+  - name: detection_params
+    type: String
+    description: 'Detection parameters as JSON'
+    default: '{}'
+  - name: handling_method
+    type: String
+    description: 'Outlier handling method: remove, clip, cap, winsorize, log_transform, sqrt_transform, flag, none'
+    default: 'clip'
+  - name: handling_params
+    type: String
+    description: 'Handling parameters as JSON'
+    default: '{}'
+
+outputs:
+  - name: preprocessed_data
+    type: Data
+    description: 'Dataset with outliers handled (PARQUET format - 10x faster than CSV)'
+  - name: report
+    type: Data
+    description: 'Outlier detection and handling report (JSON)'
+  - name: filtered_train_indices
+    type: Data
+    description: 'Train indices after removing outlier train rows (JSON). Same as input unless handling_method=remove. Use downstream instead of the split train_indices.'
+  - name: filtered_target_train
+    type: Data
+    description: 'Train labels aligned with filtered_train_indices (NPY). Use in Final Split instead of the split target_train.'
+
+implementation:
+  container:
+    image: nikhilv215/nesy-factory:v23
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import os
+        import sys
+        import json
+        import argparse
+        import logging
+        import pandas as pd
+        import numpy as np
+        from scipy import stats
+        from scipy.stats import mstats
+        from sklearn.neighbors import LocalOutlierFactor
+        from sklearn.ensemble import IsolationForest
+        from pathlib import Path
+        
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+        logger = logging.getLogger('outlier_unified')
+
+        def ensure_directory_exists(file_path):
+            directory = os.path.dirname(file_path)
+            if directory and not os.path.exists(directory):
+                os.makedirs(directory, exist_ok=True)
+
+        def detect_file_type(file_path):
+            # Detect file type by MAGIC BYTES first (not extension).
+            # CRITICAL FIX: Kubernetes passes files without extensions
+            try:
+                with open(file_path, 'rb') as f:
+                    header = f.read(8)
+                if header[:4] == b'PAR1':
+                    logger.info("[OK] Detected: Parquet (PAR1 magic bytes)")
+                    return 'parquet'
+                if header[1:6] == b'NUMPY':
+                    logger.info("[OK] Detected: NumPy array")
+                    return 'numpy'
+                if header[:2] == b'PK' or header[0] == 128:
+                    logger.info("[OK] Detected: Pickle/ZIP")
+                    return 'pickle'
+                try:
+                    text_start = open(file_path, 'r', errors='replace').read(512)
+                    if text_start.strip().startswith('{') or text_start.strip().startswith('['):
+                        return 'json'
+                    return 'csv'
+                except Exception:
+                    return 'csv'
+            except Exception as e:
+                logger.warning("Magic byte detection failed: " + str(e) + ", defaulting to CSV")
+                return 'csv'
+
+        def load_data(input_path):
+            # Load data with MAGIC BYTES detection first.
+            # CRITICAL FIX: Kubernetes strips file extensions.
+            logger.info("Loading dataset from: " + input_path)
+            ext = Path(input_path).suffix.lower()
+            logger.info("File extension: '" + ext + "' (may be empty on Kubernetes)")
+            detected_type = detect_file_type(input_path)
+            try:
+                if ext in ['.parquet', '.pq'] or detected_type == 'parquet':
+                    logger.info("Loading as Parquet...")
+                    df = pd.read_parquet(input_path, engine='pyarrow')
+                    logger.info("[OK] Loaded Parquet: " + str(df.shape[0]) + " rows x " + str(df.shape[1]) + " columns")
+                    return df
+                logger.info("Loading as CSV...")
+                for enc in ['utf-8', 'latin-1', 'cp1252']:
+                    try:
+                        df = pd.read_csv(input_path, encoding=enc)
+                        logger.info("[OK] Loaded CSV (" + enc + "): " + str(df.shape[0]) + " rows x " + str(df.shape[1]) + " columns")
+                        return df
+                    except UnicodeDecodeError:
+                        continue
+                raise ValueError("Could not decode file with any supported encoding")
+            except Exception as e:
+                logger.error("Error loading data: " + str(e))
+                raise
+        
+        def load_indices(indices_path):
+            #Load indices from JSON file#
+            with open(indices_path, 'r') as f:
+                return json.load(f)
+        
+        def save_dataframe_safely(df, output_path):
+            #Save DataFrame with explicit flushing and validation
+            #CRITICAL FIX: Prevents empty/corrupted files
+            #NOW SAVES AS PARQUET for 10x faster performance
+            logger.info("="*80)
+            logger.info("SAVING DATAFRAME SAFELY")
+            logger.info("="*80)
+            logger.info(f"Output path: {output_path}")
+            logger.info(f"Shape: {df.shape}")
+            logger.info(f"Memory: {df.memory_usage(deep=True).sum() / 1024**2:.2f} MB")
+            
+            # Ensure directory exists
+            ensure_directory_exists(output_path)
+            
+            # ============================================================
+            # CRITICAL: SAVE AS PARQUET (NOT CSV!)
+            # ============================================================
+            output_parquet = output_path
+            if not output_parquet.endswith('.parquet'):
+                output_parquet = output_parquet.replace('.csv', '.parquet')
+            
+            logger.info("Saving as PARQUET format...")
+            
+            # Save with explicit parameters
+            df.to_parquet(
+                output_parquet,
+                index=False,
+                engine='pyarrow',
+                compression='snappy'
+            )
+            
+            # Force flush and sync
+            import time
+            time.sleep(0.5)  # Give filesystem time to sync
+            
+            # Validate file was written
+            if not os.path.exists(output_parquet):
+                raise IOError(f"File was not created: {output_parquet}")
+            
+            file_size = os.path.getsize(output_parquet)
+            if file_size == 0:
+                raise IOError(f"File is empty (0 bytes): {output_parquet}")
+            
+            logger.info(f"[OK] File saved: {file_size / 1024**2:.2f} MB")
+            logger.info(f"[OK] File exists: {os.path.exists(output_parquet)}")
+            logger.info(f"  Path: {output_parquet}")
+            
+            # Quick validation: try to read back first few rows
+            try:
+                df_test = pd.read_parquet(output_parquet, engine='pyarrow')
+                logger.info(f"[OK] Validation: Successfully read back full dataset")
+                logger.info(f"  Rows: {len(df_test)}")
+                logger.info(f"  Columns: {len(df_test.columns)}")
+                
+                if len(df_test) != len(df):
+                    raise ValueError(f"Row count mismatch: {len(df_test)} != {len(df)}")
+                if len(df_test.columns) != len(df.columns):
+                    raise ValueError(f"Column count mismatch: {len(df_test.columns)} != {len(df.columns)}")
+                
+                logger.info("[OK] Validation PASSED")
+            except Exception as e:
+                logger.error(f"[FAIL] Validation FAILED: {e}")
+                raise
+            
+            logger.info("")
+            return output_parquet, file_size
+        
+        def detect_outliers_unified(df, train_indices, method, params):
+            #Detect outliers using train data statistics#
+            logger.info("="*80)
+            logger.info("UNIFIED OUTLIER DETECTION")
+            logger.info("="*80)
+            logger.info(f"Method: {method}")
+            logger.info(f"Train indices: {len(train_indices)} rows")
+            logger.info("")
+            
+            # -- Pre-process: replace +/-inf with NaN so they don't corrupt
+            # z-score means/stds or IQR quantiles. They will be handled by
+            # the missing-value imputer downstream.
+            numeric_cols_pre = df.select_dtypes(include=[np.number]).columns
+            inf_count = df[numeric_cols_pre].isin([np.inf, -np.inf]).sum().sum()
+            if inf_count > 0:
+                df = df.copy()
+                df[numeric_cols_pre] = df[numeric_cols_pre].replace([np.inf, -np.inf], np.nan)
+                logger.warning(f"[!]  Replaced {int(inf_count)} +/-inf values with NaN before detection")
+            
+            if method == 'none':
+                logger.info("Method is 'none' - no detection performed")
+                return pd.Series(False, index=df.index), None, {
+                    'method': 'none',
+                    'n_outliers': 0,
+                    'outlier_percentage': 0.0,
+                    'note': 'No outlier detection performed'
+                }
+            
+            numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+            
+            if len(numeric_cols) == 0:
+                logger.warning("No numeric columns")
+                return pd.Series(False, index=df.index), None, {
+                    'method': method,
+                    'n_outliers': 0,
+                    'warning': 'no_numeric_columns'
+                }
+            
+            logger.info(f"Analyzing {len(numeric_cols)} numeric columns")
+            
+            train_df = df.iloc[train_indices]
+            
+            detection_info = {
+                'method': method,
+                'params': params,
+                'numeric_columns': numeric_cols,
+                'n_numeric_cols': len(numeric_cols)
+            }
+            
+            detector = None
+            outlier_mask = pd.Series(False, index=df.index)
+            
+            if method == 'zscore':
+                threshold = params.get('threshold', 3.0)
+                logger.info(f"Z-score threshold: {threshold}")
+                
+                train_mean = train_df[numeric_cols].mean()
+                train_std = train_df[numeric_cols].std()
+                
+                z_scores = np.abs((df[numeric_cols] - train_mean) / train_std)
+                outlier_mask = (z_scores > threshold).any(axis=1)
+                
+                detector = {
+                    'method': 'zscore',
+                    'threshold': threshold,
+                    'mean': train_mean.to_dict(),
+                    'std': train_std.to_dict()
+                }
+                
+                detection_info['threshold'] = threshold
+            
+            elif method == 'iqr':
+                factor = params.get('factor', 1.5)
+                logger.info(f"IQR factor: {factor}")
+                
+                bounds = {}
+                for col in numeric_cols:
+                    Q1 = train_df[col].quantile(0.25)
+                    Q3 = train_df[col].quantile(0.75)
+                    IQR = Q3 - Q1
+                    
+                    lower = Q1 - factor * IQR
+                    upper = Q3 + factor * IQR
+                    
+                    bounds[col] = {
+                        'lower': float(lower),
+                        'upper': float(upper),
+                        'Q1': float(Q1),
+                        'Q3': float(Q3),
+                        'IQR': float(IQR)
+                    }
+                    
+                    col_outliers = (df[col] < lower) | (df[col] > upper)
+                    outlier_mask = outlier_mask | col_outliers
+                
+                detector = {'method': 'iqr', 'bounds': bounds, 'factor': factor}
+                detection_info['bounds'] = bounds
+            
+            elif method == 'lof':
+                n_neighbors = params.get('n_neighbors', 20)
+                contamination = params.get('contamination', 0.1)
+                
+                X_train = train_df[numeric_cols].values
+                
+                if len(train_df) < n_neighbors:
+                    n_neighbors = max(2, len(train_df) - 1)
+                    logger.warning(f"Adjusted n_neighbors to {n_neighbors}")
+                
+                lof = LocalOutlierFactor(n_neighbors=n_neighbors, contamination=contamination, novelty=True)
+                lof.fit(X_train)
+                
+                X_all = df[numeric_cols].values
+                outlier_labels = lof.predict(X_all)
+                outlier_mask = pd.Series(outlier_labels == -1, index=df.index)
+                
+                detector = lof
+                detection_info['n_neighbors'] = n_neighbors
+                detection_info['contamination'] = contamination
+            
+            elif method == 'isolation_forest':
+                contamination = params.get('contamination', 0.1)
+                n_estimators = params.get('n_estimators', 100)
+                random_state = params.get('random_state', 42)
+                
+                X_train = train_df[numeric_cols].values
+                
+                iso = IsolationForest(
+                    contamination=contamination,
+                    n_estimators=n_estimators,
+                    random_state=random_state,
+                    n_jobs=-1
+                )
+                iso.fit(X_train)
+                
+                X_all = df[numeric_cols].values
+                outlier_labels = iso.predict(X_all)
+                outlier_mask = pd.Series(outlier_labels == -1, index=df.index)
+                
+                detector = iso
+                detection_info['contamination'] = contamination
+                detection_info['n_estimators'] = n_estimators
+            
+            n_outliers = outlier_mask.sum()
+            pct = (n_outliers / len(df) * 100) if len(df) > 0 else 0
+            detection_info['n_outliers'] = int(n_outliers)
+            detection_info['outlier_percentage'] = float(pct)
+            
+            logger.info(f"Detected {n_outliers} outliers ({pct:.2f}%)")
+            logger.info("")
+            
+            return outlier_mask, detector, detection_info
+        
+        def handle_outliers_unified(df, outlier_mask, method, params, detection_info, train_indices):
+            #Handle detected outliers#
+            logger.info("="*80)
+            logger.info("HANDLING OUTLIERS")
+            logger.info("="*80)
+            logger.info(f"Method: {method}")
+            logger.info("")
+            
+            if method == 'none':
+                logger.info("Method is 'none' - passing data through")
+                return df, {
+                    'method': 'none', 
+                    'n_rows_removed': 0,
+                    'initial_shape': list(df.shape),
+                    'final_shape': list(df.shape),
+                    'note': 'Data passed through unchanged'
+                }
+            
+            df_handled = df.copy()
+            numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+            
+            stats = {
+                'method': method,
+                'params': params,
+                'n_outliers_detected': int(outlier_mask.sum()),
+                'n_rows_removed': 0
+            }
+            
+            train_df = df.iloc[train_indices]
+
+            if method == 'remove':
+                # v2: rows are NOT deleted from the combined data (indices + labels must stay aligned).
+                # Outlier TRAIN rows are excluded from the train set in main(); val/test rows are kept.
+                train_mask = outlier_mask.iloc[train_indices].values
+                stats['n_rows_removed'] = int(train_mask.sum())
+                stats['removal_scope'] = 'train rows only (val/test untouched)'
+                logger.info(f"Excluding {stats['n_rows_removed']} outlier rows from the TRAIN set "
+                            f"({int(outlier_mask.sum()) - stats['n_rows_removed']} val/test outliers kept)")
+
+            elif method in ['clip', 'cap']:
+                use_iqr = params.get('use_iqr', True)
+                factor = params.get('factor', 1.5)
+                
+                if detection_info and 'bounds' in detection_info:
+                    bounds = detection_info['bounds']
+                    logger.info("Using bounds from detection")
+                elif use_iqr:
+                    logger.info(f"Computing IQR bounds on TRAIN rows (factor={factor})")
+                    bounds = {}
+                    for col in numeric_cols:
+                        Q1 = train_df[col].quantile(0.25)
+                        Q3 = train_df[col].quantile(0.75)
+                        IQR = Q3 - Q1
+                        bounds[col] = {
+                            'lower': Q1 - factor * IQR,
+                            'upper': Q3 + factor * IQR
+                        }
+                else:
+                    logger.info("Using TRAIN min/max bounds")
+                    bounds = {col: {'lower': train_df[col].min(), 'upper': train_df[col].max()} for col in numeric_cols}
+                stats['bounds'] = {c: {k: float(v) for k, v in b.items()} for c, b in bounds.items()
+                                   if c in numeric_cols}
+                
+                for col in numeric_cols:
+                    if col in bounds:
+                        df_handled[col] = df_handled[col].clip(
+                            lower=bounds[col]['lower'],
+                            upper=bounds[col]['upper']
+                        )
+                
+                logger.info(f"Clipped {len(numeric_cols)} columns")
+            
+            elif method == 'winsorize':
+                limits = params.get('limits', [0.05, 0.05])
+                logger.info(f"Winsorizing with limits: {limits} (percentiles from TRAIN rows)")
+                win_bounds = {}
+                for col in numeric_cols:
+                    lo = train_df[col].quantile(limits[0])
+                    hi = train_df[col].quantile(1 - limits[1])
+                    df_handled[col] = df_handled[col].clip(lower=lo, upper=hi)
+                    win_bounds[col] = {'lower': float(lo), 'upper': float(hi)}
+                stats['bounds'] = win_bounds
+                logger.info(f"Winsorized {len(numeric_cols)} columns")
+            
+            elif method == 'log_transform':
+                transformed = 0
+                for col in numeric_cols:
+                    if (df_handled[col] > 0).all():
+                        df_handled[col] = np.log1p(df_handled[col])
+                        transformed += 1
+                logger.info(f"Log transformed {transformed} columns")
+            
+            elif method == 'sqrt_transform':
+                transformed = 0
+                for col in numeric_cols:
+                    if (df_handled[col] >= 0).all():
+                        df_handled[col] = np.sqrt(df_handled[col])
+                        transformed += 1
+                logger.info(f"Square root transformed {transformed} columns")
+            
+            elif method == 'flag':
+                flag_col = params.get('flag_column', 'is_outlier')
+                df_handled[flag_col] = outlier_mask.astype(int)
+                logger.info(f"Added flag column: {flag_col}")
+            
+            stats['initial_shape'] = list(df.shape)
+            stats['final_shape'] = list(df_handled.shape)
+            
+            logger.info(f"Final shape: {df_handled.shape}")
+            logger.info("")
+            
+            return df_handled, stats
+        
+        def main():
+            parser = argparse.ArgumentParser(description="Unified Outlier Detection & Handling (PARQUET OPTIMIZED)")
+            parser.add_argument("--combined_data", required=True)
+            parser.add_argument("--train_indices", required=True)
+            parser.add_argument("--target_train", required=True)
+            parser.add_argument("--detection_method", default='zscore')
+            parser.add_argument("--detection_params", default='{}')
+            parser.add_argument("--handling_method", default='clip')
+            parser.add_argument("--handling_params", default='{}')
+            parser.add_argument("--output_preprocessed_data", required=True)
+            parser.add_argument("--output_report", required=True)
+            parser.add_argument("--output_filtered_train_indices", required=True)
+            parser.add_argument("--output_filtered_target_train", required=True)
+
+            args = parser.parse_args()
+
+            def write_train_outputs(train_indices, target_train, outlier_mask=None):
+                # Filtered train indices + aligned labels (unchanged unless handling_method == 'remove')
+                keep = np.ones(len(train_indices), dtype=bool)
+                if outlier_mask is not None and args.handling_method == 'remove':
+                    keep = ~outlier_mask.iloc[train_indices].values.astype(bool)
+                    max_frac = float(json.loads(args.handling_params or '{}').get('max_remove_fraction', 0.5))
+                    if (~keep).mean() > max_frac:
+                        raise ValueError(f"'remove' would drop {(~keep).mean():.0%} of train rows "
+                                         f"(> max_remove_fraction={max_frac}). Use clip/winsorize or tune detection.")
+                new_idx = [int(i) for i, k in zip(train_indices, keep) if k]
+                if target_train.size:
+                    if len(target_train) != len(train_indices):
+                        raise ValueError(f"target_train length {len(target_train)} != train_indices {len(train_indices)}")
+                    new_y = target_train[keep]
+                else:
+                    new_y = target_train
+                for p in (args.output_filtered_train_indices, args.output_filtered_target_train):
+                    ensure_directory_exists(p)
+                with open(args.output_filtered_train_indices, 'w') as f:
+                    json.dump(new_idx, f)
+                with open(args.output_filtered_target_train, 'wb') as f:
+                    np.save(f, new_y, allow_pickle=False)
+                logger.info(f"[OK] Train rows: {len(train_indices)} -> {len(new_idx)} | labels: {len(new_y)}")
+                return len(train_indices) - len(new_idx)
+
+            def load_target(path):
+                try:
+                    if os.path.getsize(path) == 0:
+                        return np.array([])
+                    return np.load(path, allow_pickle=False)
+                except Exception as e:
+                    logger.warning(f"Could not read target_train ({e}) - treating as unsupervised")
+                    return np.array([])
+            
+            logger.info("="*80)
+            logger.info("UNIFIED OUTLIER DETECTION & HANDLING (PARQUET)")
+            logger.info("="*80)
+            logger.info(f"Detection: {args.detection_method}")
+            logger.info(f"Handling: {args.handling_method}")
+            logger.info("")
+            
+            try:
+                ensure_directory_exists(args.output_preprocessed_data)
+                ensure_directory_exists(args.output_report)
+                
+                detection_params = json.loads(args.detection_params)
+                handling_params = json.loads(args.handling_params)
+                
+                df = load_data(args.combined_data)
+                train_indices = load_indices(args.train_indices)
+                target_train = load_target(args.target_train)
+
+                if df.empty:
+                    logger.error("ERROR: Dataset is empty")
+                    sys.exit(1)
+                
+                logger.info(f"Input data shape: {df.shape}")
+                logger.info("")
+                
+                # PASSTHROUGH MODE
+                if args.detection_method == 'none' and args.handling_method == 'none':
+                    logger.info("="*80)
+                    logger.info("PASSTHROUGH MODE")
+                    logger.info("="*80)
+                    logger.info("Both detection and handling are 'none'")
+                    logger.info("Passing data through unchanged")
+                    logger.info("")
+                    
+                    # CRITICAL FIX: Use safe save function (NOW WITH PARQUET!)
+                    output_path, file_size = save_dataframe_safely(df, args.output_preprocessed_data)
+                    write_train_outputs(train_indices, target_train)
+
+                    report = {
+                        'detection': {
+                            'method': 'none',
+                            'n_outliers': 0,
+                            'outlier_percentage': 0.0,
+                            'note': 'No outlier detection performed'
+                        },
+                        'handling': {
+                            'method': 'none',
+                            'n_rows_removed': 0,
+                            'initial_shape': list(df.shape),
+                            'final_shape': list(df.shape),
+                            'note': 'Data passed through unchanged'
+                        },
+                        'passthrough': True,
+                        'output_format': {
+                            'format': 'parquet',
+                            'engine': 'pyarrow',
+                            'compression': 'snappy',
+                            'file_size_mb': float(file_size / 1024**2)
+                        }
+                    }
+                    
+                    with open(args.output_report, 'w') as f:
+                        json.dump(report, f, indent=2)
+                    logger.info("[OK] Report saved")
+                    
+                    logger.info("")
+                    logger.info("="*80)
+                    logger.info("PASSTHROUGH COMPLETED")
+                    logger.info("="*80)
+                    logger.info(f"Final shape: {df.shape}")
+                    logger.info(f"Output format: PARQUET")
+                    logger.info("="*80)
+                    
+                else:
+                    # Normal processing
+                    outlier_mask, detector, detection_info = detect_outliers_unified(
+                        df=df,
+                        train_indices=train_indices,
+                        method=args.detection_method,
+                        params=detection_params
+                    )
+                    
+                    df_handled, handling_stats = handle_outliers_unified(
+                        df=df,
+                        outlier_mask=outlier_mask,
+                        method=args.handling_method,
+                        params=handling_params,
+                        detection_info=detection_info,
+                        train_indices=train_indices
+                    )
+                    if len(df_handled) != len(df):
+                        raise RuntimeError("Row count changed - split indices would be misaligned")
+
+                    # CRITICAL FIX: Use safe save function (NOW WITH PARQUET!)
+                    output_path, file_size = save_dataframe_safely(df_handled, args.output_preprocessed_data)
+                    write_train_outputs(train_indices, target_train, outlier_mask)
+
+                    report = {
+                        'detection': detection_info,
+                        'handling': handling_stats,
+                        'passthrough': False,
+                        'output_format': {
+                            'format': 'parquet',
+                            'engine': 'pyarrow',
+                            'compression': 'snappy',
+                            'file_size_mb': float(file_size / 1024**2)
+                        }
+                    }
+                    
+                    with open(args.output_report, 'w') as f:
+                        json.dump(report, f, indent=2)
+                    logger.info("[OK] Report saved")
+                    
+                    logger.info("")
+                    logger.info("="*80)
+                    logger.info("OUTLIER PROCESSING COMPLETED")
+                    logger.info("="*80)
+                    logger.info(f"Detection: {args.detection_method}")
+                    logger.info(f"Final shape: {df_handled.shape}")
+                    logger.info(f"Output format: PARQUET (10x faster than CSV)")
+                    logger.info(f"File size: {file_size / 1024**2:.2f} MB")
+                    logger.info("="*80)
+                
+            except Exception as e:
+                logger.error(f"ERROR: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                sys.exit(1)
+        
+        if __name__ == "__main__":
+            main()
+    args:
+      - --combined_data
+      - {inputPath: combined_data}
+      - --train_indices
+      - {inputPath: train_indices}
+      - --target_train
+      - {inputPath: target_train}
+      - --detection_method
+      - {inputValue: detection_method}
+      - --detection_params
+      - {inputValue: detection_params}
+      - --handling_method
+      - {inputValue: handling_method}
+      - --handling_params
+      - {inputValue: handling_params}
+      - --output_preprocessed_data
+      - {outputPath: preprocessed_data}
+      - --output_report
+      - {outputPath: report}
+      - --output_filtered_train_indices
+      - {outputPath: filtered_train_indices}
+      - --output_filtered_target_train
+      - {outputPath: filtered_target_train}

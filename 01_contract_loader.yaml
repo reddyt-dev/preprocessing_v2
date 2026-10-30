@@ -1,0 +1,377 @@
+name: Tabular Contract Loader and Target Extraction
+description: |
+  +======================================================================+
+  |  TABULAR PIPELINE v2 - T1 CONTRACT LOADER                            |
+  |  Master (M1-M5) -> [THIS] -> DataSplitting -> FeatureTypeEncoding... |
+  +======================================================================+
+  |  Replaces old 2_data_loading + 3_data_handling + 4_data_quality.     |
+  |  - Downloads the contract published by the master pipeline          |
+  |    (contract_manifest.json -> data, resolved_schema, ...).          |
+  |  - Uses column ROLES from the master: drops id / ignore / system /  |
+  |    media columns, extracts the target column.                        |
+  |  - Target: classification -> int labels (mapping saved),            |
+  |    regression -> float (no truncation), NaN targets dropped.         |
+  |  - ALL row removal happens here, BEFORE the split (null target,     |
+  |    duplicates, rows with too many missing values), so indices stay  |
+  |    aligned in every later step.                                      |
+  |  - Outputs keep the old loader contract (features parquet + NPY     |
+  |    ground truth) so Data Splitting works unchanged.                  |
+  +======================================================================+
+
+inputs:
+  - name: contract_manifest_url
+    type: String
+    description: 'URL (or local path) of contract_manifest.json published by the master pipeline'
+  - name: access_token
+    type: String
+    description: 'Bearer token (string or file path) for downloading contract files. Empty = env ACCESS_TOKEN'
+    default: ''
+  - name: target_column
+    type: String
+    description: 'Override the target from the contract (empty = use contract target)'
+    default: ''
+  - name: task_type
+    type: String
+    description: 'Override the task (auto = use contract task_type): classification, regression, clustering, anomaly_detection'
+    default: 'auto'
+  - name: target_mapping
+    type: String
+    description: 'JSON label mapping for classification targets, e.g. {"no":0,"yes":1}. {} = automatic'
+    default: '{}'
+  - name: drop_roles
+    type: String
+    description: 'Comma-separated column roles removed from features'
+    default: 'id,ignore,row_id,parent_key,item_index,media'
+  - name: cleaning_config
+    type: String
+    description: |
+      JSON (all optional):
+        drop_null_target      (bool,  true)   drop rows whose target is missing
+        drop_duplicate_rows   (bool,  true)   drop exact duplicate rows (features + target) before the split
+        row_missing_threshold (float, null)   drop rows with more than this fraction of missing features
+        drop_all_null_columns (bool,  true)
+        drop_constant_columns (bool,  true)
+        min_rows              (int,   10)
+    default: '{}'
+
+outputs:
+  - name: features
+    type: Data
+    description: 'Feature table (Parquet) - target and dropped-role columns removed'
+  - name: ground_truth
+    type: Data
+    description: 'Encoded target (NPY). Empty array when there is no target (unsupervised)'
+  - name: loader_metadata
+    type: Data
+    description: 'JSON: contract info, dropped columns/rows with reasons, target encoding, class distribution'
+  - name: feature_schema
+    type: Data
+    description: 'JSON: per remaining column semantic type + role (used by Feature Type Encoding)'
+  - name: task_type_out
+    type: String
+    description: 'Resolved task type'
+  - name: stratify
+    type: String
+    description: '"true" for classification, else "false" (wire into Data Splitting stratify)'
+
+implementation:
+  container:
+    image: nikhilv215/nesy-factory:v23
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import os, sys, json, shutil, argparse, logging, tempfile
+        import numpy as np
+        import pandas as pd
+        import requests
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+        L = logging.getLogger('tabular_contract_loader')
+
+        DEFAULTS = {
+            'drop_null_target': True,
+            'drop_duplicate_rows': True,
+            'row_missing_threshold': None,
+            'drop_all_null_columns': True,
+            'drop_constant_columns': True,
+            'min_rows': 10,
+        }
+        SUPERVISED = {'classification', 'regression'}
+
+        def bar(msg):
+            L.info('=' * 70)
+            L.info(f'  {msg}')
+            L.info('=' * 70)
+
+        def mkdirs(p):
+            d = os.path.dirname(p)
+            if d:
+                os.makedirs(d, exist_ok=True)
+
+        def read_token(v):
+            v = (v or '').strip()
+            if v and os.path.isfile(v):
+                with open(v) as f:
+                    v = f.read().strip()
+            return v or os.environ.get('ACCESS_TOKEN', '').strip()
+
+        def session():
+            s = requests.Session()
+            r = Retry(total=5, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+            s.mount('http://', HTTPAdapter(max_retries=r))
+            s.mount('https://', HTTPAdapter(max_retries=r))
+            return s
+
+        def fetch(ref, base, token, dest_dir):
+            # Download (http/https) or resolve a local path; relative refs resolve against the manifest location
+            if ref.startswith(('http://', 'https://')):
+                dest = os.path.join(dest_dir, f'f{len(os.listdir(dest_dir))}')
+                headers = {'Authorization': f'Bearer {token}'} if token else {}
+                with session().get(ref, headers=headers, timeout=300, stream=True) as r:
+                    r.raise_for_status()
+                    with open(dest, 'wb') as f:
+                        for chunk in r.iter_content(1 << 20):
+                            f.write(chunk)
+                return dest
+            if base and not os.path.isabs(ref) and not base.startswith(('http://', 'https://')):
+                ref = os.path.join(os.path.dirname(base), ref)
+            if not os.path.exists(ref):
+                raise FileNotFoundError(f'Contract file not found: {ref}')
+            return ref
+
+        def fetch_json(ref, base, token, tmp):
+            with open(fetch(ref, base, token, tmp), 'r', encoding='utf-8') as f:
+                return json.load(f)
+
+        def safe_nunique(s):
+            try:
+                return int(s.nunique(dropna=True))
+            except TypeError:
+                return int(s.astype(str).nunique(dropna=True))
+
+        def encode_target(y, task, mapping_json):
+            info = {'dtype_in': str(y.dtype), 'n_unique': safe_nunique(y)}
+            numeric = pd.api.types.is_numeric_dtype(y) and not pd.api.types.is_bool_dtype(y)
+            if task == 'regression':
+                yv = pd.to_numeric(y, errors='coerce')
+                bad = int(yv.isna().sum() - y.isna().sum())
+                if bad:
+                    raise ValueError(f'Regression target has {bad} non-numeric values')
+                info.update({'encoding': 'float64', 'min': float(yv.min()), 'max': float(yv.max()),
+                             'mean': float(yv.mean()), 'std': float(yv.std())})
+                return yv.astype('float64').values, info
+            mapping = json.loads(mapping_json) if mapping_json and mapping_json.strip() not in ('', '{}') else {}
+            if mapping:
+                keys = y.astype(str)
+                enc = keys.map({str(k): v for k, v in mapping.items()})
+                unmapped = sorted(keys[enc.isna()].unique().tolist())
+                if unmapped:
+                    raise ValueError(f'target_mapping incomplete, unmapped labels: {unmapped[:20]}')
+                info.update({'encoding': 'custom_mapping', 'mapping': mapping})
+                return enc.astype('int64').values, info
+            if numeric:
+                yv = pd.to_numeric(y)
+                if bool(np.all(np.mod(yv, 1) == 0)):
+                    info['encoding'] = 'integer labels (unchanged)'
+                    return yv.astype('int64').values, info
+                if task == 'classification':
+                    raise ValueError('Classification target has non-integer numeric values - use task_type=regression '
+                                     'or provide target_mapping')
+                info['encoding'] = 'float64 (unchanged)'
+                return yv.astype('float64').values, info
+            labels = sorted(y.astype(str).unique().tolist())
+            mapping = {lab: i for i, lab in enumerate(labels)}
+            info.update({'encoding': 'auto (sorted labels)', 'mapping': mapping})
+            return y.astype(str).map(mapping).astype('int64').values, info
+
+        def main():
+            ap = argparse.ArgumentParser()
+            ap.add_argument('--contract_manifest_url', required=True)
+            ap.add_argument('--access_token', default='')
+            ap.add_argument('--target_column', default='')
+            ap.add_argument('--task_type', default='auto')
+            ap.add_argument('--target_mapping', default='{}')
+            ap.add_argument('--drop_roles', default='id,ignore,row_id,parent_key,item_index,media')
+            ap.add_argument('--cleaning_config', default='{}')
+            ap.add_argument('--output_features', required=True)
+            ap.add_argument('--output_ground_truth', required=True)
+            ap.add_argument('--output_loader_metadata', required=True)
+            ap.add_argument('--output_feature_schema', required=True)
+            ap.add_argument('--output_task_type', required=True)
+            ap.add_argument('--output_stratify', required=True)
+            args = ap.parse_args()
+
+            cfg = dict(DEFAULTS)
+            if args.cleaning_config and args.cleaning_config.strip():
+                cfg.update(json.loads(args.cleaning_config))
+            token = read_token(args.access_token)
+            tmp = tempfile.mkdtemp(prefix='contract_')
+
+            # -- 1. Contract -------------------------------------------------
+            bar('TABULAR CONTRACT LOADER')
+            base = args.contract_manifest_url
+            manifest = fetch_json(base, None, token, tmp)
+            files = manifest.get('files', {})
+            schema = fetch_json(files['resolved_schema'], base, token, tmp)
+            primary = schema.get('primary_table', 'main')
+            if primary == 'main':
+                data_ref = files['data']
+            else:
+                data_ref = (files.get('secondary_tables') or {}).get(primary)
+                if not data_ref:
+                    raise ValueError(f'Primary table "{primary}" not listed in manifest files.secondary_tables')
+            df = pd.read_parquet(fetch(data_ref, base, token, tmp), engine='pyarrow')
+            cols_meta = schema.get('columns', {})
+            L.info(f'Contract: master_run_id={manifest.get("master_run_id")} modality={schema.get("modality")} '
+                   f'task={schema.get("task_type")} table={primary} -> {df.shape[0]:,} rows x {df.shape[1]} cols')
+            if schema.get('modality') not in (None, 'tabular'):
+                L.warning(f'Contract modality is "{schema.get("modality")}" - running the TABULAR pipeline anyway')
+
+            task = (args.task_type or 'auto').strip().lower()
+            task = schema.get('task_type') if task in ('', 'auto') else task
+            target = (args.target_column or '').strip() or schema.get('target')
+            if target and target not in df.columns:
+                raise ValueError(f'Target "{target}" not in data columns: {list(df.columns)}')
+            if task in SUPERVISED and not target:
+                raise ValueError(f'task_type={task} needs a target column')
+            n0 = len(df)
+            meta = {'contract': {'manifest': base, 'master_run_id': manifest.get('master_run_id'),
+                                 'modality': schema.get('modality'), 'primary_table': primary,
+                                 'routing_confidence': schema.get('confidence')},
+                    'task_type': task, 'target': target, 'initial_shape': list(df.shape),
+                    'dropped_columns': {}, 'dropped_rows': {}}
+
+            # -- 2. Drop columns by role -------------------------------------
+            drop_roles = {r.strip() for r in args.drop_roles.split(',') if r.strip()}
+            role_drop = [c for c in df.columns if c != target and cols_meta.get(c, {}).get('role') in drop_roles]
+            if role_drop:
+                df = df.drop(columns=role_drop)
+                meta['dropped_columns']['by_role'] = {c: cols_meta[c]['role'] for c in role_drop}
+                L.info(f'Dropped {len(role_drop)} columns by role: {role_drop}')
+
+            # -- 3. Row cleaning (BEFORE split) ------------------------------
+            if target and cfg['drop_null_target']:
+                m = df[target].isna()
+                if m.any():
+                    df = df[~m]
+                    meta['dropped_rows']['null_target'] = int(m.sum())
+                    L.warning(f'Dropped {int(m.sum())} rows with missing target')
+            feat_cols = [c for c in df.columns if c != target]
+            thr = cfg.get('row_missing_threshold')
+            if thr is not None and feat_cols:
+                m = df[feat_cols].isna().mean(axis=1) > float(thr)
+                if m.any():
+                    df = df[~m]
+                    meta['dropped_rows']['row_missing_threshold'] = int(m.sum())
+                    L.info(f'Dropped {int(m.sum())} rows with > {thr:.0%} missing features')
+            if cfg['drop_duplicate_rows'] and len(df):
+                try:
+                    m = df.duplicated()
+                except TypeError:
+                    m = df.astype(str).duplicated()
+                if m.any():
+                    df = df[~m]
+                    meta['dropped_rows']['duplicates'] = int(m.sum())
+                    L.info(f'Dropped {int(m.sum())} duplicate rows')
+            df = df.reset_index(drop=True)
+
+            # -- 4. Column cleaning ------------------------------------------
+            if cfg['drop_all_null_columns']:
+                c_null = [c for c in feat_cols if c in df.columns and df[c].isna().all()]
+                if c_null:
+                    df = df.drop(columns=c_null)
+                    meta['dropped_columns']['all_null'] = c_null
+            if cfg['drop_constant_columns']:
+                c_const = [c for c in df.columns if c != target and safe_nunique(df[c]) <= 1 and not df[c].isna().all()]
+                if c_const:
+                    df = df.drop(columns=c_const)
+                    meta['dropped_columns']['constant'] = c_const
+            if len(df) < int(cfg['min_rows']):
+                raise ValueError(f'Only {len(df)} rows left after cleaning (min_rows={cfg["min_rows"]})')
+
+            # -- 5. Target ---------------------------------------------------
+            if target:
+                y, tinfo = encode_target(df[target], task, args.target_mapping)
+                X = df.drop(columns=[target])
+                if task == 'classification':
+                    vals, cnts = np.unique(y, return_counts=True)
+                    tinfo['class_distribution'] = {str(int(v)): int(c) for v, c in zip(vals, cnts)}
+                    for v, c in zip(vals, cnts):
+                        L.info(f'  class {int(v)}: {c} ({c / len(y):.1%})')
+                meta['target_info'] = tinfo
+            else:
+                y = np.array([], dtype=np.float64)
+                X = df
+                L.info('No target - unsupervised mode (empty ground truth)')
+            if X.shape[1] == 0:
+                raise ValueError('No feature columns left')
+
+            # -- 6. Outputs --------------------------------------------------
+            feature_schema = {
+                'task_type': task, 'target': target,
+                'columns': {c: {'semantic': cols_meta.get(c, {}).get('semantic', 'unknown'),
+                                'role': cols_meta.get(c, {}).get('role', 'feature'),
+                                'origin': cols_meta.get(c, {}).get('origin'),
+                                'evidence': cols_meta.get(c, {}).get('evidence', {}),
+                                'dtype': str(X[c].dtype)} for c in X.columns},
+            }
+            meta.update({'final_shape': list(X.shape), 'rows_removed_total': int(n0 - len(X)),
+                         'semantic_counts': pd.Series([v['semantic'] for v in feature_schema['columns'].values()])
+                         .value_counts().to_dict()})
+
+            for p in (args.output_features, args.output_ground_truth, args.output_loader_metadata,
+                      args.output_feature_schema, args.output_task_type, args.output_stratify):
+                mkdirs(p)
+            X.to_parquet(args.output_features, index=False, engine='pyarrow', compression='snappy')
+            with open(args.output_ground_truth, 'wb') as f:
+                np.save(f, y, allow_pickle=False)
+            with open(args.output_loader_metadata, 'w') as f:
+                json.dump(meta, f, indent=2, default=str)
+            with open(args.output_feature_schema, 'w') as f:
+                json.dump(feature_schema, f, indent=2, default=str)
+            with open(args.output_task_type, 'w') as f:
+                f.write(task or 'clustering')
+            with open(args.output_stratify, 'w') as f:
+                f.write('true' if task == 'classification' else 'false')
+            shutil.rmtree(tmp, ignore_errors=True)
+            bar(f'DONE - {X.shape[0]:,} rows x {X.shape[1]} features | task={task} | target={target}')
+
+        if __name__ == '__main__':
+            try:
+                main()
+            except Exception as e:
+                L.error(f'CONTRACT LOADER FAILED: {e}')
+                import traceback
+                traceback.print_exc()
+                sys.exit(1)
+    args:
+      - --contract_manifest_url
+      - {inputValue: contract_manifest_url}
+      - --access_token
+      - {inputValue: access_token}
+      - --target_column
+      - {inputValue: target_column}
+      - --task_type
+      - {inputValue: task_type}
+      - --target_mapping
+      - {inputValue: target_mapping}
+      - --drop_roles
+      - {inputValue: drop_roles}
+      - --cleaning_config
+      - {inputValue: cleaning_config}
+      - --output_features
+      - {outputPath: features}
+      - --output_ground_truth
+      - {outputPath: ground_truth}
+      - --output_loader_metadata
+      - {outputPath: loader_metadata}
+      - --output_feature_schema
+      - {outputPath: feature_schema}
+      - --output_task_type
+      - {outputPath: task_type_out}
+      - --output_stratify
+      - {outputPath: stratify}

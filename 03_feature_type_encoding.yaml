@@ -1,0 +1,459 @@
+name: Tabular Feature Type Encoding (Train-Aware)
+description: |
+  +======================================================================+
+  |  TABULAR PIPELINE v2 - T3 FEATURE TYPE ENCODING                      |
+  |  ContractLoader -> DataSplitting -> [THIS] -> MissingValues -> ...   |
+  +======================================================================+
+  |  "Part B" of the old Generic Auto Data Type Handler. Runs AFTER the |
+  |  split. Column types come from the master's semantic schema (no     |
+  |  re-detection). Turns every special type into numeric features:    |
+  |    datetime     -> calendar parts + cyclic sin/cos + days_since_min  |
+  |                    (min taken from TRAIN rows)                       |
+  |    array_string -> multi-label 0/1 columns, vocabulary from TRAIN   |
+  |    array_numeric-> 12 summary statistics                             |
+  |    url / email / ip / mac / phone / geo / hex / complex / interval  |
+  |                 -> structural features                               |
+  |    text         -> 16 text statistics                                |
+  |    json kept as string -> key / item counts + length                 |
+  |  Numeric, boolean and categorical columns pass through unchanged    |
+  |  (Missing Values and Categorical Encoding handle them).              |
+  |  Row count and order never change -> split indices stay valid.     |
+  +======================================================================+
+
+inputs:
+  - name: combined_data
+    type: Data
+    description: 'Combined dataset from Data Splitting (Parquet)'
+  - name: train_indices
+    type: Data
+    description: 'Train row indices (JSON array) from Data Splitting'
+  - name: feature_schema
+    type: Data
+    description: 'feature_schema JSON from the Contract Loader'
+  - name: config
+    type: String
+    description: |
+      JSON (all optional):
+        datetime_cyclic       (bool, true)   add sin/cos for month, day-of-week, hour
+        datetime_unix         (bool, false)  add unix seconds
+        multilabel_min_freq   (int|"auto", "auto")  auto = max(5, 1% of train rows)
+        multilabel_max_labels (int, 100)     keep at most this many labels (+ __other__)
+        drop_identifiers      (bool, true)   drop uuid/identifier columns that reached this step
+    default: '{}'
+
+outputs:
+  - name: type_encoded_data
+    type: Data
+    description: 'Dataset with special types converted to numeric features (Parquet)'
+  - name: encoder_state
+    type: Data
+    description: 'JSON: everything fitted on train (datetime minimums, label vocabularies) for inference replay'
+  - name: type_report
+    type: Data
+    description: 'JSON: per column semantic type, handler, columns created'
+
+implementation:
+  container:
+    image: nikhilv215/nesy-factory:v23
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import os, re, sys, json, math, base64, argparse, logging, warnings
+        from collections import Counter
+        from urllib.parse import urlparse, parse_qs
+        warnings.filterwarnings('ignore')
+        import numpy as np
+        import pandas as pd
+
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+        L = logging.getLogger('feature_type_encoding')
+        SEP = '__'
+        DEFAULTS = {
+            'datetime_cyclic': True,
+            'datetime_unix': False,
+            'multilabel_min_freq': 'auto',
+            'multilabel_max_labels': 100,
+            'drop_identifiers': True,
+        }
+        PASSTHROUGH = {'numeric', 'boolean', 'categorical', 'code', 'empty', 'unknown', 'other', 'skipped'}
+
+        def mkdirs(p):
+            d = os.path.dirname(p)
+            if d:
+                os.makedirs(d, exist_ok=True)
+
+        def missing(v):
+            if v is None:
+                return True
+            try:
+                return bool(pd.isna(v))
+            except Exception:
+                return False
+
+        def row_features(series, fn, keys):
+            # Apply a per-value feature function; missing values -> NaN for every feature
+            rows = [({k: np.nan for k in keys} if missing(v) else fn(v)) for v in series.tolist()]
+            out = pd.DataFrame(rows, index=series.index, columns=keys)
+            return out.apply(pd.to_numeric, errors='coerce')
+
+        def parse_list(v):
+            if isinstance(v, (list, tuple)):
+                return list(v)
+            try:
+                r = json.loads(v)
+                return r if isinstance(r, list) else []
+            except Exception:
+                return []
+
+        # ================================================================
+        # ROW-WISE HANDLERS (no fitting)
+        # ================================================================
+
+        URL_K = ['is_https', 'path_depth', 'path_len', 'has_query', 'query_param_count', 'has_fragment',
+                 'host_len', 'host_dot_count', 'is_ip_host', 'has_port', 'path_has_extension']
+
+        def f_url(v):
+            try:
+                p = urlparse(str(v))
+                host = p.netloc.lower()
+                return {'is_https': int(p.scheme == 'https'), 'path_depth': len([x for x in p.path.split('/') if x]),
+                        'path_len': len(p.path), 'has_query': int(bool(p.query)),
+                        'query_param_count': len(parse_qs(p.query)), 'has_fragment': int(bool(p.fragment)),
+                        'host_len': len(p.netloc), 'host_dot_count': p.netloc.count('.'),
+                        'is_ip_host': int(bool(re.match(r'^\d+\.\d+\.\d+\.\d+$', host))),
+                        'has_port': int(':' in p.netloc.split('@')[-1]),
+                        'path_has_extension': int('.' in os.path.basename(p.path))}
+            except Exception:
+                return {k: np.nan for k in URL_K}
+
+        EMAIL_K = ['local_len', 'domain_len', 'has_dot_local', 'has_plus', 'domain_dot_count', 'tld_len',
+                   'local_digit_count']
+
+        def f_email(v):
+            parts = str(v).split('@')
+            if len(parts) != 2:
+                return {k: np.nan for k in EMAIL_K}
+            local, domain = parts
+            dp = domain.split('.')
+            return {'local_len': len(local), 'domain_len': len(domain), 'has_dot_local': int('.' in local),
+                    'has_plus': int('+' in local), 'domain_dot_count': len(dp) - 1, 'tld_len': len(dp[-1]),
+                    'local_digit_count': sum(c.isdigit() for c in local)}
+
+        PRIV = [(167772160, 184549375), (2886729728, 2887778303), (3232235520, 3232301055)]
+        IP_K = ['is_ipv6', 'oct1', 'oct2', 'oct3', 'oct4', 'is_private', 'is_loopback', 'ip_class']
+
+        def f_ip(v):
+            v = str(v).strip()
+            if ':' in v:
+                return {'is_ipv6': 1, 'oct1': 0, 'oct2': 0, 'oct3': 0, 'oct4': 0,
+                        'is_private': int(v == '::1' or v.lower().startswith(('fc', 'fd'))),
+                        'is_loopback': int(v == '::1'), 'ip_class': -1}
+            try:
+                o = [int(p) for p in v.split('.')]
+                ii = (o[0] << 24) + (o[1] << 16) + (o[2] << 8) + o[3]
+                return {'is_ipv6': 0, 'oct1': o[0], 'oct2': o[1], 'oct3': o[2], 'oct4': o[3],
+                        'is_private': int(any(lo <= ii <= hi for lo, hi in PRIV)), 'is_loopback': int(o[0] == 127),
+                        'ip_class': 0 if o[0] < 128 else 1 if o[0] < 192 else 2 if o[0] < 224 else 3}
+            except Exception:
+                return {k: np.nan for k in IP_K}
+
+        MAC_K = ['oui_int', 'is_multicast', 'is_locally_admin']
+
+        def f_mac(v):
+            try:
+                ints = [int(p, 16) for p in str(v).upper().replace('-', ':').split(':')]
+                return {'oui_int': (ints[0] << 16) + (ints[1] << 8) + ints[2],
+                        'is_multicast': int(bool(ints[0] & 1)), 'is_locally_admin': int(bool(ints[0] & 2))}
+            except Exception:
+                return {k: np.nan for k in MAC_K}
+
+        PHONE_K = ['digit_count', 'has_country_code', 'char_len', 'has_extension']
+
+        def f_phone(v):
+            v = str(v).strip()
+            return {'digit_count': len(re.sub(r'\D', '', v)), 'has_country_code': int(v.startswith('+')),
+                    'char_len': len(v), 'has_extension': int(bool(re.search(r'(?:ext|x)\s*\d', v, re.I)))}
+
+        GEO_K = ['lat', 'lon', 'is_northern', 'is_eastern']
+
+        def f_geo(v):
+            s = str(v).strip()
+            lat = lon = np.nan
+            m = re.match(r'^\(?\s*(-?\d{1,3}\.\d+)\s*,\s*(-?\d{1,3}\.\d+)\s*\)?$', s)
+            m2 = re.match(r'POINT\s*\(\s*(-?\d+\.?\d*)\s+(-?\d+\.?\d*)\s*\)', s, re.I)
+            if m:
+                lat, lon = float(m.group(1)), float(m.group(2))
+            elif m2:
+                lat, lon = float(m2.group(2)), float(m2.group(1))
+            return {'lat': lat, 'lon': lon,
+                    'is_northern': np.nan if np.isnan(lat) else int(lat >= 0),
+                    'is_eastern': np.nan if np.isnan(lon) else int(lon >= 0)}
+
+        HEX_K = ['hex_int', 'hex_str_len']
+
+        def f_hex(v):
+            s = str(v).strip().lower().replace('0x', '')
+            try:
+                return {'hex_int': int(s, 16) % (2 ** 31), 'hex_str_len': len(s)}
+            except Exception:
+                return {k: np.nan for k in HEX_K}
+
+        COMPLEX_K = ['real', 'imag', 'magnitude', 'phase_angle']
+
+        def f_complex(v):
+            try:
+                c = complex(str(v).replace(' ', '').replace('i', 'j'))
+                return {'real': c.real, 'imag': c.imag, 'magnitude': abs(c), 'phase_angle': math.atan2(c.imag, c.real)}
+            except Exception:
+                return {k: np.nan for k in COMPLEX_K}
+
+        INTERVAL_K = ['left', 'right', 'mid', 'width', 'is_open_left', 'is_open_right']
+
+        def f_interval(v):
+            m = re.match(r'^([\[\(])\s*(-?\d+\.?\d*)\s*,\s*(-?\d+\.?\d*)\s*([\]\)])', str(v).strip())
+            if not m:
+                return {k: np.nan for k in INTERVAL_K}
+            lb, lv, rv, rb = m.group(1, 2, 3, 4)
+            lo, hi = float(lv), float(rv)
+            return {'left': lo, 'right': hi, 'mid': (lo + hi) / 2, 'width': hi - lo,
+                    'is_open_left': int(lb == '('), 'is_open_right': int(rb == ')')}
+
+        TEXT_K = ['char_len', 'word_count', 'unique_word_count', 'lexical_diversity', 'avg_word_len', 'max_word_len',
+                  'sentence_count', 'avg_sent_len_words', 'digit_count', 'digit_ratio', 'upper_ratio',
+                  'special_char_count', 'has_url_in_text', 'has_email_in_text', 'has_number', 'starts_with_capital']
+
+        def f_text(v):
+            s = str(v)
+            words = s.split()
+            uniq = {w.lower() for w in words}
+            sents = [x for x in re.split(r'[.!?]+', s) if x.strip()]
+            return {'char_len': len(s), 'word_count': len(words), 'unique_word_count': len(uniq),
+                    'lexical_diversity': len(uniq) / max(len(words), 1),
+                    'avg_word_len': sum(len(w) for w in words) / max(len(words), 1),
+                    'max_word_len': max((len(w) for w in words), default=0),
+                    'sentence_count': max(len(sents), 1), 'avg_sent_len_words': len(words) / max(len(sents), 1),
+                    'digit_count': sum(c.isdigit() for c in s), 'digit_ratio': sum(c.isdigit() for c in s) / max(len(s), 1),
+                    'upper_ratio': sum(c.isupper() for c in s) / max(len(s), 1),
+                    'special_char_count': len(re.findall(r'[^a-zA-Z0-9\s]', s)),
+                    'has_url_in_text': int(bool(re.search(r'https?://', s))),
+                    'has_email_in_text': int(bool(re.search(r'\S+@\S+\.\S+', s))),
+                    'has_number': int(bool(re.search(r'\d', s))), 'starts_with_capital': int(bool(s) and s[0].isupper())}
+
+        ARR_K = ['len', 'mean', 'std', 'min', 'max', 'sum', 'median', 'q25', 'q75', 'range', 'nnz', 'sparsity']
+
+        def f_array_numeric(v):
+            a = []
+            for x in parse_list(v):
+                try:
+                    a.append(float(x))
+                except Exception:
+                    pass
+            if not a:
+                return dict({k: np.nan for k in ARR_K}, len=0)
+            arr = np.array(a)
+            nnz = float(np.count_nonzero(arr))
+            return {'len': len(arr), 'mean': arr.mean(), 'std': arr.std(), 'min': arr.min(), 'max': arr.max(),
+                    'sum': arr.sum(), 'median': np.median(arr), 'q25': np.percentile(arr, 25),
+                    'q75': np.percentile(arr, 75), 'range': np.ptp(arr), 'nnz': nnz, 'sparsity': 1 - nnz / len(arr)}
+
+        JSON_K = ['n_items', 'char_len']
+
+        def f_json(v):
+            s = str(v)
+            try:
+                o = json.loads(s)
+                n = len(o) if isinstance(o, (dict, list)) else 1
+            except Exception:
+                n = np.nan
+            return {'n_items': n, 'char_len': len(s)}
+
+        B64_K = ['decoded_byte_len']
+
+        def f_b64(v):
+            try:
+                return {'decoded_byte_len': len(base64.b64decode(str(v).strip() + '=='))}
+            except Exception:
+                return {'decoded_byte_len': np.nan}
+
+        ROWWISE = {
+            'url': (f_url, URL_K), 'email': (f_email, EMAIL_K), 'ipv4': (f_ip, IP_K), 'ipv6': (f_ip, IP_K),
+            'mac': (f_mac, MAC_K), 'phone': (f_phone, PHONE_K), 'geo': (f_geo, GEO_K), 'hex': (f_hex, HEX_K),
+            'complex_number': (f_complex, COMPLEX_K), 'interval': (f_interval, INTERVAL_K),
+            'text': (f_text, TEXT_K), 'array_numeric': (f_array_numeric, ARR_K),
+            'json_object': (f_json, JSON_K), 'json_records': (f_json, JSON_K), 'xml': (f_text, TEXT_K),
+            'base64': (f_b64, B64_K),
+        }
+
+        # ================================================================
+        # TRAIN-FITTED HANDLERS
+        # ================================================================
+
+        def enc_datetime(s, train_idx, cfg):
+            dt = pd.to_datetime(s, errors='coerce')
+            try:
+                dt = dt.dt.tz_localize(None)
+            except Exception:
+                pass
+            train_dt = dt.iloc[train_idx].dropna()
+            tmin = train_dt.min() if len(train_dt) else dt.min()
+            has_time = bool(((dt.dt.hour != 0) | (dt.dt.minute != 0)).any())
+            out = pd.DataFrame(index=s.index)
+            out['year'] = dt.dt.year
+            out['month'] = dt.dt.month
+            out['day'] = dt.dt.day
+            out['dayofweek'] = dt.dt.dayofweek
+            out['quarter'] = dt.dt.quarter
+            out['dayofyear'] = dt.dt.dayofyear
+            out['weekofyear'] = dt.dt.isocalendar().week.astype('float64').values
+            out['is_weekend'] = (dt.dt.dayofweek >= 5).astype('float64').where(dt.notna())
+            out['is_month_end'] = dt.dt.is_month_end.astype('float64').where(dt.notna())
+            out['days_since_min'] = (dt - tmin).dt.total_seconds() / 86400.0
+            if has_time:
+                out['hour'] = dt.dt.hour
+            if cfg['datetime_cyclic']:
+                out['month_sin'] = np.sin(2 * np.pi * (dt.dt.month - 1) / 12)
+                out['month_cos'] = np.cos(2 * np.pi * (dt.dt.month - 1) / 12)
+                out['dow_sin'] = np.sin(2 * np.pi * dt.dt.dayofweek / 7)
+                out['dow_cos'] = np.cos(2 * np.pi * dt.dt.dayofweek / 7)
+                if has_time:
+                    out['hour_sin'] = np.sin(2 * np.pi * dt.dt.hour / 24)
+                    out['hour_cos'] = np.cos(2 * np.pi * dt.dt.hour / 24)
+            if cfg['datetime_unix']:
+                out['unix_ts'] = (dt - pd.Timestamp('1970-01-01')).dt.total_seconds()
+            out = out.astype('float64')
+            return out, {'train_min': str(tmin), 'has_time': has_time}
+
+        def enc_multilabel(s, train_idx, cfg):
+            lists = s.map(lambda v: [] if missing(v) else [str(x) for x in parse_list(v)])
+            n_train = len(train_idx)
+            mf = cfg['multilabel_min_freq']
+            min_freq = max(5, int(0.01 * n_train)) if mf == 'auto' else int(mf)
+            freq = Counter(x for lst in lists.iloc[train_idx] for x in set(lst))
+            vocab = [lab for lab, c in freq.most_common(int(cfg['multilabel_max_labels'])) if c >= min_freq]
+            vset = set(vocab)
+            out = pd.DataFrame(index=s.index)
+            for lab in vocab:
+                safe = re.sub(r'[^0-9A-Za-z_]+', '_', lab) or 'blank'
+                name = safe
+                k = 1
+                while name in out.columns:
+                    name = f'{safe}_{k}'
+                    k += 1
+                out[name] = lists.map(lambda lst, lab=lab: float(lab in lst))
+            out['__other__'] = lists.map(lambda lst: float(any(x not in vset for x in lst)))
+            out['__n_labels__'] = lists.map(len).astype('float64')
+            out = out.where(s.notna())
+            return out, {'vocabulary': vocab, 'min_freq': min_freq, 'n_train_rows': n_train}
+
+        def main():
+            ap = argparse.ArgumentParser()
+            ap.add_argument('--combined_data', required=True)
+            ap.add_argument('--train_indices', required=True)
+            ap.add_argument('--feature_schema', required=True)
+            ap.add_argument('--config', default='{}')
+            ap.add_argument('--output_type_encoded_data', required=True)
+            ap.add_argument('--output_encoder_state', required=True)
+            ap.add_argument('--output_type_report', required=True)
+            args = ap.parse_args()
+
+            cfg = dict(DEFAULTS)
+            if args.config and args.config.strip():
+                cfg.update(json.loads(args.config))
+            df = pd.read_parquet(args.combined_data, engine='pyarrow')
+            with open(args.train_indices) as f:
+                train_idx = [int(i) for i in json.load(f)]
+            with open(args.feature_schema) as f:
+                fschema = json.load(f)
+            cols_meta = fschema.get('columns', {})
+            L.info(f'Input: {df.shape[0]:,} rows x {df.shape[1]} cols | train rows: {len(train_idx):,}')
+            if train_idx and max(train_idx) >= len(df):
+                raise ValueError('train_indices out of range for combined_data')
+
+            n_rows = len(df)
+            parts, state, report = [], {}, {}
+            for col in df.columns:
+                sem = cols_meta.get(col, {}).get('semantic', 'unknown')
+                if pd.api.types.is_datetime64_any_dtype(df[col]):
+                    sem = 'datetime'
+                s = df[col]
+                try:
+                    if sem in PASSTHROUGH:
+                        parts.append(s.to_frame())
+                        report[col] = {'semantic': sem, 'handler': 'passthrough', 'columns_created': [col]}
+                        continue
+                    if sem in ('uuid', 'identifier'):
+                        if cfg['drop_identifiers']:
+                            report[col] = {'semantic': sem, 'handler': 'dropped_identifier', 'columns_created': []}
+                        else:
+                            parts.append(s.to_frame())
+                            report[col] = {'semantic': sem, 'handler': 'passthrough', 'columns_created': [col]}
+                        continue
+                    if sem == 'datetime':
+                        feats, st = enc_datetime(s, train_idx, cfg)
+                        handler = 'datetime_parts'
+                    elif sem == 'array_string':
+                        feats, st = enc_multilabel(s, train_idx, cfg)
+                        handler = 'multilabel_binarize (vocabulary from train)'
+                    elif sem in ROWWISE:
+                        fn, keys = ROWWISE[sem]
+                        feats, st = row_features(s, fn, keys), {}
+                        handler = f'rowwise_{fn.__name__[2:]}'
+                    else:
+                        parts.append(s.to_frame())
+                        report[col] = {'semantic': sem, 'handler': 'passthrough (no handler)', 'columns_created': [col]}
+                        continue
+                    feats.columns = [f'{col}{SEP}{c}' for c in feats.columns]
+                    feats.index = df.index
+                    parts.append(feats)
+                    state[col] = {'semantic': sem, 'handler': handler, 'columns': list(feats.columns), 'state': st}
+                    report[col] = {'semantic': sem, 'handler': handler, 'columns_created': list(feats.columns)}
+                    L.info(f'  {col:40s} [{sem:14s}] -> {len(feats.columns)} cols ({handler})')
+                except Exception as e:
+                    L.error(f'  {col}: handler failed ({e}) - column passed through')
+                    parts.append(s.to_frame())
+                    report[col] = {'semantic': sem, 'handler': 'passthrough (handler error)', 'error': str(e),
+                                   'columns_created': [col]}
+
+            out = pd.concat(parts, axis=1) if parts else pd.DataFrame(index=df.index)
+            num = out.select_dtypes(include=[np.number]).columns
+            out[num] = out[num].replace([np.inf, -np.inf], np.nan)
+            if len(out) != n_rows:
+                raise RuntimeError('Row count changed - this must never happen after the split')
+
+            for p in (args.output_type_encoded_data, args.output_encoder_state, args.output_type_report):
+                mkdirs(p)
+            out.to_parquet(args.output_type_encoded_data, index=False, engine='pyarrow', compression='snappy')
+            with open(args.output_encoder_state, 'w') as f:
+                json.dump({'config': cfg, 'columns': state}, f, indent=2, default=str)
+            with open(args.output_type_report, 'w') as f:
+                json.dump({'input_shape': list(df.shape), 'output_shape': list(out.shape),
+                           'remaining_non_numeric': out.select_dtypes(exclude=[np.number]).columns.tolist(),
+                           'columns': report}, f, indent=2, default=str)
+            L.info(f'[OK] {df.shape} -> {out.shape} | non-numeric left for categorical encoding: '
+                   f'{out.select_dtypes(exclude=[np.number]).columns.tolist()}')
+
+        if __name__ == '__main__':
+            try:
+                main()
+            except Exception as e:
+                L.error(f'FEATURE TYPE ENCODING FAILED: {e}')
+                import traceback
+                traceback.print_exc()
+                sys.exit(1)
+    args:
+      - --combined_data
+      - {inputPath: combined_data}
+      - --train_indices
+      - {inputPath: train_indices}
+      - --feature_schema
+      - {inputPath: feature_schema}
+      - --config
+      - {inputValue: config}
+      - --output_type_encoded_data
+      - {outputPath: type_encoded_data}
+      - --output_encoder_state
+      - {outputPath: encoder_state}
+      - --output_type_report
+      - {outputPath: type_report}

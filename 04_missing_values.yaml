@@ -1,0 +1,281 @@
+name: Generic Missing Values Handler (Train-Aware) v2
+description: Train-aware missing value handling. Runs AFTER data splitting - every imputer is fitted on TRAIN rows only and applied to all rows (no test leakage). Row dropping is not allowed here (it would break split indices) - use the Contract Loader cleaning_config instead. Methods - drop_cols, mean, median, mode, constant, zero, knn, iterative, mice, forward_fill, backward_fill, none. Numeric and categorical columns are imputed separately so dtypes are preserved. Loads Parquet/CSV, SAVES AS PARQUET.
+
+inputs:
+  - name: input_data
+    type: Data
+    description: 'Combined dataset (train + val + test rows) (Parquet or CSV)'
+  - name: train_indices
+    type: Data
+    description: 'Train row indices (JSON array) from Data Splitting / Outlier step'
+  - name: method
+    type: String
+    description: 'Imputation method: drop_cols, mean, median, mode, constant, zero, knn, iterative, mice, forward_fill, backward_fill, none'
+    default: 'mean'
+  - name: method_params
+    type: String
+    description: 'Method-specific parameters as JSON string. Examples: {"n_neighbors":5}, {"drop_threshold":0.5}, {"fill_value":0, "categorical_fill_value":"missing"}, {"max_iter":10}'
+    default: '{}'
+
+outputs:
+  - name: imputed_data      # unique artifact name (avoids Argo 'data' name collisions)
+    type: Data
+    description: 'Dataset with missing values handled (PARQUET format)'
+  - name: imputer
+    type: Model
+    description: 'Fitted imputers (PKL dict: numeric, categorical, dropped_columns, columns) - fitted on train rows'
+  - name: report
+    type: Data
+    description: 'Imputation report and statistics (JSON format)'
+
+implementation:
+  container:
+    image: nikhilv215/nesy-factory:v23
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import os
+        import sys
+        import json
+        import argparse
+        import logging
+        import pickle
+        import pandas as pd
+        import numpy as np
+        from sklearn.impute import SimpleImputer, KNNImputer
+        from sklearn.experimental import enable_iterative_imputer
+        from sklearn.impute import IterativeImputer
+        from pathlib import Path
+
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        logger = logging.getLogger('missing_values_handler_v2')
+
+        METHODS = ['drop_cols', 'mean', 'median', 'mode', 'constant', 'zero', 'knn', 'iterative', 'mice',
+                   'forward_fill', 'ffill', 'backward_fill', 'bfill', 'none']
+
+
+        def ensure_directory_exists(file_path):
+            directory = os.path.dirname(file_path)
+            if directory and not os.path.exists(directory):
+                os.makedirs(directory, exist_ok=True)
+
+
+        def load_data(input_path):
+            logger.info("Loading dataset from: " + input_path)
+            with open(input_path, 'rb') as f:
+                header = f.read(4)
+            if header == b'PAR1' or Path(input_path).suffix.lower() in ['.parquet', '.pq']:
+                df = pd.read_parquet(input_path, engine='pyarrow')
+            else:
+                df = None
+                for enc in ['utf-8', 'latin-1', 'cp1252']:
+                    try:
+                        df = pd.read_csv(input_path, encoding=enc)
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                if df is None:
+                    raise ValueError("Could not decode file with any supported encoding")
+            logger.info(f"[OK] Loaded: {df.shape[0]} rows x {df.shape[1]} columns")
+            return df
+
+
+        def analyze_missing_patterns(df, train_idx):
+            train = df.iloc[train_idx]
+            info = {
+                'total_missing': int(df.isnull().sum().sum()),
+                'train_missing': int(train.isnull().sum().sum()),
+                'missing_percentage': float(df.isnull().sum().sum() / max(df.size, 1) * 100),
+                'rows_with_missing': int(df.isnull().any(axis=1).sum()),
+                'columns_with_missing': {},
+            }
+            for col in df.columns:
+                n = int(df[col].isnull().sum())
+                if n:
+                    info['columns_with_missing'][col] = {
+                        'count': n, 'percentage': float(n / len(df) * 100),
+                        'train_percentage': float(train[col].isnull().mean() * 100) if len(train) else 0.0,
+                        'dtype': str(df[col].dtype)}
+                    logger.info(f"  {col}: {n} missing ({n / len(df) * 100:.1f}%)")
+            return info
+
+
+        def split_columns(df):
+            numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+            cat_cols = [c for c in df.columns if c not in numeric_cols]
+            return numeric_cols, cat_cols
+
+
+        def fit_apply(imputer, df, cols, train_idx):
+            # fit on train rows, transform all rows, keep dtype + column set
+            if not cols:
+                return None
+            imputer.fit(df.iloc[train_idx][cols])
+            values = imputer.transform(df[cols])
+            df[cols] = pd.DataFrame(values, columns=cols, index=df.index)
+            return imputer
+
+
+        def handle_missing_values(df, train_idx, method, params):
+            logger.info("=" * 80)
+            logger.info(f"HANDLING MISSING VALUES (train-aware) - method: {method}")
+            logger.info("=" * 80)
+            if method not in METHODS:
+                if method == 'drop_rows':
+                    raise ValueError("drop_rows is not allowed after the split (it breaks train/test indices). "
+                                     "Use the Contract Loader cleaning_config (row_missing_threshold) instead.")
+                raise ValueError(f"Unknown method: {method}. Available: {METHODS}")
+
+            df_imputed = df.copy()
+            fitted = {'method': method, 'numeric': None, 'categorical': None, 'dropped_columns': [],
+                      'columns': list(df.columns)}
+            stats = {'method': method, 'method_params': params, 'initial_missing': int(df.isnull().sum().sum()),
+                     'initial_shape': list(df.shape), 'dropped_columns': [], 'fitted_on_rows': len(train_idx)}
+            if method == 'none':
+                stats.update({'final_missing': stats['initial_missing'], 'final_shape': list(df.shape),
+                              'imputation_success': stats['initial_missing'] == 0})
+                return df_imputed, fitted, stats
+
+            train = df_imputed.iloc[train_idx]
+
+            # Columns entirely empty in TRAIN cannot be learned -> dropped (sklearn would silently drop them)
+            empty_in_train = [c for c in df_imputed.columns if train[c].isnull().all()]
+            if method == 'drop_cols':
+                thr = float(params.get('drop_threshold', 0.5))
+                miss = train.isnull().mean()
+                empty_in_train = sorted(set(empty_in_train) | set(miss[miss > thr].index.tolist()))
+                logger.info(f"Drop threshold (on train rows): {thr:.0%}")
+            if empty_in_train:
+                df_imputed = df_imputed.drop(columns=empty_in_train)
+                fitted['dropped_columns'] = empty_in_train
+                stats['dropped_columns'] = empty_in_train
+                logger.warning(f"Dropped {len(empty_in_train)} columns: {empty_in_train}")
+            numeric_cols, cat_cols = split_columns(df_imputed)
+            numeric_missing = [c for c in numeric_cols if df_imputed[c].isnull().any()]
+            cat_missing = [c for c in cat_cols if df_imputed[c].isnull().any()]
+
+            if method == 'drop_cols':
+                pass
+            elif method in ('mean', 'median', 'mode', 'knn', 'iterative', 'mice'):
+                if method in ('mean', 'median'):
+                    num_imp = SimpleImputer(strategy=method)
+                elif method == 'mode':
+                    num_imp = SimpleImputer(strategy='most_frequent')
+                elif method == 'knn':
+                    num_imp = KNNImputer(n_neighbors=int(params.get('n_neighbors', 5)),
+                                         weights=params.get('weights', 'uniform'))
+                else:
+                    num_imp = IterativeImputer(max_iter=int(params.get('max_iter', 10)),
+                                               random_state=int(params.get('random_state', 42)),
+                                               sample_posterior=bool(params.get('sample_posterior', method == 'mice')),
+                                               verbose=0)
+                # knn / iterative / mice use all numeric columns as predictors
+                cols = numeric_cols if method in ('knn', 'iterative', 'mice') else numeric_missing
+                if cols and numeric_missing:
+                    fitted['numeric'] = fit_apply(num_imp, df_imputed, cols, train_idx)
+                    logger.info(f"{method} imputation: {len(numeric_missing)} numeric columns (fitted on train)")
+                if cat_missing:
+                    cat_imp = SimpleImputer(strategy='most_frequent')
+                    # None (Parquet nulls) is not "missing" for SimpleImputer -> normalize to np.nan
+                    df_imputed[cat_missing] = df_imputed[cat_missing].astype(object).where(
+                        df_imputed[cat_missing].notna(), np.nan)
+                    fitted['categorical'] = fit_apply(cat_imp, df_imputed, cat_missing, train_idx)
+                    logger.info(f"Mode imputation: {len(cat_missing)} categorical columns (fitted on train)")
+            elif method in ('constant', 'zero'):
+                fill_value = 0 if method == 'zero' else params.get('fill_value', 0)
+                cat_fill = params.get('categorical_fill_value', 'missing')
+                if numeric_missing:
+                    df_imputed[numeric_missing] = df_imputed[numeric_missing].fillna(fill_value)
+                for c in cat_missing:
+                    df_imputed[c] = df_imputed[c].astype(object).where(df_imputed[c].notna(), cat_fill)
+                fitted['numeric'] = {'fill_value': fill_value}
+                fitted['categorical'] = {'fill_value': cat_fill}
+                logger.info(f"Constant imputation: numeric={fill_value}, categorical={cat_fill!r}")
+            elif method in ('forward_fill', 'ffill'):
+                df_imputed = df_imputed.ffill().bfill()
+                logger.info("Forward fill (backward fill for leading NaNs) - row-order based, nothing fitted")
+            elif method in ('backward_fill', 'bfill'):
+                df_imputed = df_imputed.bfill().ffill()
+                logger.info("Backward fill (forward fill for trailing NaNs) - row-order based, nothing fitted")
+
+            final_missing = int(df_imputed.isnull().sum().sum())
+            stats.update({'final_missing': final_missing, 'final_shape': list(df_imputed.shape),
+                          'imputation_success': final_missing == 0,
+                          'missing_reduction_pct': float((stats['initial_missing'] - final_missing)
+                                                         / stats['initial_missing'] * 100)
+                          if stats['initial_missing'] else 0.0})
+            logger.info(f"Missing before: {stats['initial_missing']} | after: {final_missing}")
+            return df_imputed, fitted, stats
+
+
+        def main():
+            parser = argparse.ArgumentParser(description="Missing Values Handler v2 (train-aware)")
+            parser.add_argument("--input_data", required=True)
+            parser.add_argument("--train_indices", required=True)
+            parser.add_argument("--method", default='mean')
+            parser.add_argument("--method_params", type=str, default='{}')
+            parser.add_argument("--output_data", required=True)
+            parser.add_argument("--output_imputer", required=True)
+            parser.add_argument("--output_report", required=True)
+            args = parser.parse_args()
+
+            try:
+                for p in (args.output_data, args.output_imputer, args.output_report):
+                    ensure_directory_exists(p)
+                method_params = json.loads(args.method_params) if args.method_params.strip() else {}
+                df = load_data(args.input_data)
+                if df.empty:
+                    raise ValueError("Dataset is empty")
+                with open(args.train_indices) as f:
+                    train_idx = [int(i) for i in json.load(f)]
+                if not train_idx or max(train_idx) >= len(df):
+                    raise ValueError(f"train_indices invalid for {len(df)} rows")
+
+                missing_analysis = analyze_missing_patterns(df, train_idx)
+                method = args.method.strip().lower()
+                if missing_analysis['total_missing'] == 0:
+                    logger.info("No missing values - no imputation needed")
+                    method = 'none'
+                df_imputed, fitted, stats = handle_missing_values(df, train_idx, method, method_params)
+                if len(df_imputed) != len(df):
+                    raise RuntimeError("Row count changed - indices would be misaligned")
+
+                df_imputed.to_parquet(args.output_data, index=False, engine='pyarrow', compression='snappy')
+                with open(args.output_imputer, 'wb') as f:
+                    pickle.dump(fitted, f)
+                report = {'missing_analysis': missing_analysis, 'imputation_stats': stats,
+                          'method': args.method, 'train_aware': True,
+                          'output_format': {'format': 'parquet', 'engine': 'pyarrow', 'compression': 'snappy',
+                                            'file_size_mb': float(os.path.getsize(args.output_data) / 1024**2)}}
+                with open(args.output_report, 'w') as f:
+                    json.dump(report, f, indent=2, default=str)
+                logger.info(f"[OK] Done: {df_imputed.shape}, remaining missing: {stats['final_missing']}")
+            except Exception as e:
+                logger.error(f"ERROR: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                sys.exit(1)
+
+
+        if __name__ == "__main__":
+            main()
+    args:
+      - --input_data
+      - {inputPath: input_data}
+      - --train_indices
+      - {inputPath: train_indices}
+      - --method
+      - {inputValue: method}
+      - --method_params
+      - {inputValue: method_params}
+      - --output_data
+      - {outputPath: imputed_data}
+      - --output_imputer
+      - {outputPath: imputer}
+      - --output_report
+      - {outputPath: report}
